@@ -27,6 +27,8 @@ use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+#[cfg(not(windows))]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -689,6 +691,220 @@ async fn turn_start_shell_zsh_fork_exec_approval_multiple_subcommands_v2() -> Re
         mcp.read_stream_until_notification_message("codex/event/task_complete"),
     )
     .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_shell_zsh_fork_recovers_after_sidecar_protocol_corruption_v2() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let tmp = TempDir::new()?;
+    let codex_home = tmp.path().join("codex_home");
+    std::fs::create_dir(&codex_home)?;
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir(&workspace)?;
+
+    let Some(zsh_path) = find_test_zsh_path() else {
+        eprintln!("skipping zsh fork recovery test: no zsh executable found");
+        return Ok(());
+    };
+    eprintln!(
+        "using zsh path for zsh-fork recovery test: {}",
+        zsh_path.display()
+    );
+
+    let responses = vec![
+        create_shell_command_sse_response(
+            vec!["echo".to_string(), "first".to_string()],
+            None,
+            Some(5000),
+            "call-zsh-fork-recovery-1",
+        )?,
+        create_final_assistant_message_sse_response("first done")?,
+        create_shell_command_sse_response(
+            vec!["echo".to_string(), "second".to_string()],
+            None,
+            Some(5000),
+            "call-zsh-fork-recovery-2",
+        )?,
+        create_final_assistant_message_sse_response("second done")?,
+    ];
+    let server = create_mock_responses_server_sequence(responses).await;
+    create_config_toml(
+        &codex_home,
+        &server.uri(),
+        "never",
+        &BTreeMap::from([
+            (Feature::ShellZshFork, true),
+            (Feature::UnifiedExec, false),
+            (Feature::ShellSnapshot, false),
+        ]),
+        &zsh_path,
+    )?;
+
+    let real_sidecar = match codex_utils_cargo_bin::cargo_bin("codex-zsh-sidecar") {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!(
+                "skipping zsh fork recovery test: could not locate codex-zsh-sidecar binary: {err}"
+            );
+            return Ok(());
+        }
+    };
+    let sidecar_dir = real_sidecar.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "codex-zsh-sidecar path has no parent directory: {}",
+            real_sidecar.display()
+        )
+    })?;
+    let shim_dir = tmp.path().join("sidecar_shim");
+    std::fs::create_dir(&shim_dir)?;
+    let marker_file = shim_dir.join("first_call_done");
+    let shim_path = shim_dir.join("codex-zsh-sidecar");
+    std::fs::write(
+        &shim_path,
+        format!(
+            r#"#!/bin/sh
+if [ ! -f "{marker}" ]; then
+  touch "{marker}"
+  printf 'this-is-not-json\n'
+  exit 1
+fi
+exec "{real_sidecar}" "$@"
+"#,
+            marker = marker_file.display(),
+            real_sidecar = real_sidecar.display()
+        ),
+    )?;
+    std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755))?;
+
+    let mut path = OsString::from(shim_dir.as_os_str());
+    path.push(":");
+    path.push(sidecar_dir.as_os_str());
+    if let Some(existing) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(existing);
+    }
+    let path_str = path.to_string_lossy().into_owned();
+
+    let mut mcp =
+        McpProcess::new_with_env(&codex_home, &[("PATH", Some(path_str.as_str()))]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let first_turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "run first".to_string(),
+                text_elements: Vec::new(),
+            }],
+            cwd: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(first_turn_id)),
+    )
+    .await??;
+
+    let first_completed_command_execution = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let completed_notif = mcp
+                .read_stream_until_notification_message("item/completed")
+                .await?;
+            let completed: ItemCompletedNotification = serde_json::from_value(
+                completed_notif
+                    .params
+                    .clone()
+                    .expect("item/completed params"),
+            )?;
+            if let ThreadItem::CommandExecution { .. } = completed.item {
+                return Ok::<ThreadItem, anyhow::Error>(completed.item);
+            }
+        }
+    })
+    .await??;
+    let ThreadItem::CommandExecution { id, status, .. } = first_completed_command_execution else {
+        unreachable!("loop ensures we break on command execution items");
+    };
+    assert_eq!(id, "call-zsh-fork-recovery-1");
+    assert_eq!(status, CommandExecutionStatus::Declined);
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let second_turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![V2UserInput::Text {
+                text: "run second".to_string(),
+                text_elements: Vec::new(),
+            }],
+            cwd: Some(workspace),
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(second_turn_id)),
+    )
+    .await??;
+
+    let second_completed_command_execution = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let completed_notif = mcp
+                .read_stream_until_notification_message("item/completed")
+                .await?;
+            let completed: ItemCompletedNotification = serde_json::from_value(
+                completed_notif
+                    .params
+                    .clone()
+                    .expect("item/completed params"),
+            )?;
+            if let ThreadItem::CommandExecution { .. } = completed.item {
+                return Ok::<ThreadItem, anyhow::Error>(completed.item);
+            }
+        }
+    })
+    .await??;
+    let ThreadItem::CommandExecution {
+        id,
+        status,
+        exit_code,
+        aggregated_output,
+        ..
+    } = second_completed_command_execution
+    else {
+        unreachable!("loop ensures we break on command execution items");
+    };
+    assert_eq!(id, "call-zsh-fork-recovery-2");
+    assert_eq!(status, CommandExecutionStatus::Completed);
+    assert_eq!(exit_code, Some(0));
+    let output = aggregated_output.expect("aggregated output should be present");
+    assert!(output.contains("second"));
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),

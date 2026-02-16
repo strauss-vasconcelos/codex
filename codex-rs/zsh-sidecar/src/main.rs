@@ -200,7 +200,10 @@ async fn main() -> Result<()> {
         return run_exec_wrapper_mode();
     }
 
-    tracing_subscriber::fmt().with_env_filter("warn").init();
+    tracing_subscriber::fmt()
+        .with_env_filter("warn")
+        .with_writer(std::io::stderr)
+        .init();
     let args = Args::parse();
     let mut stdout = tokio::io::stdout();
 
