@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -27,6 +28,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
@@ -53,6 +55,7 @@ use codex_app_server_protocol::SendUserMessageParams;
 use codex_app_server_protocol::SendUserMessageResponse;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -68,6 +71,30 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
+
+const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
+    // Legacy codex/event (v1-style) deltas.
+    "codex/event/agent_message_content_delta",
+    "codex/event/agent_message_delta",
+    "codex/event/agent_reasoning_delta",
+    "codex/event/reasoning_content_delta",
+    "codex/event/reasoning_raw_content_delta",
+    "codex/event/exec_command_output_delta",
+    // Other legacy events.
+    "codex/event/exec_approval_request",
+    "codex/event/exec_command_begin",
+    "codex/event/exec_command_end",
+    "codex/event/exec_output",
+    "codex/event/item_started",
+    "codex/event/item_completed",
+    // v2 item deltas.
+    "item/agentMessage/delta",
+    "item/plan/delta",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/textDelta",
+];
 
 /// Minimal launcher that initializes the Codex app-server and logs the handshake.
 #[derive(Parser)]
@@ -144,6 +171,18 @@ enum CliCommand {
         /// Follow-up user message for the second turn.
         follow_up_message: String,
     },
+    /// Trigger zsh-fork multi-subcommand approvals and assert expected approval behavior.
+    #[command(name = "trigger-zsh-fork-multi-cmd-approval")]
+    TriggerZshForkMultiCmdApproval {
+        /// Optional prompt; defaults to an explicit `/usr/bin/true && /usr/bin/true` command.
+        user_message: Option<String>,
+        /// Minimum number of command-approval callbacks expected in the turn.
+        #[arg(long, default_value_t = 2)]
+        min_approvals: usize,
+        /// One-based approval index to decline (e.g. --deny-on 2 declines the second approval).
+        #[arg(long)]
+        deny_on: Option<usize>,
+    },
     /// Trigger the ChatGPT login flow and wait for completion.
     TestLogin,
     /// Fetch the current account rate limits from the Codex app-server.
@@ -200,6 +239,18 @@ pub fn run() -> Result<()> {
             follow_up_message,
             &dynamic_tools,
         ),
+        CliCommand::TriggerZshForkMultiCmdApproval {
+            user_message,
+            min_approvals,
+            deny_on,
+        } => trigger_zsh_fork_multi_cmd_approval(
+            &codex_bin,
+            &config_overrides,
+            user_message,
+            min_approvals,
+            deny_on,
+            &dynamic_tools,
+        ),
         CliCommand::TestLogin => {
             ensure_dynamic_tools_unused(&dynamic_tools, "test-login")?;
             test_login(&codex_bin, &config_overrides)
@@ -251,6 +302,99 @@ pub fn send_message_v2(
         None,
         dynamic_tools,
     )
+}
+
+fn trigger_zsh_fork_multi_cmd_approval(
+    codex_bin: &Path,
+    config_overrides: &[String],
+    user_message: Option<String>,
+    min_approvals: usize,
+    deny_on: Option<usize>,
+    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
+) -> Result<()> {
+    if let Some(deny_on) = deny_on
+        && deny_on == 0
+    {
+        bail!("--deny-on must be >= 1 when provided");
+    }
+
+    let default_prompt = "Run this exact command using shell command execution without rewriting or splitting it: /usr/bin/true && /usr/bin/true";
+    let message = user_message.unwrap_or_else(|| default_prompt.to_string());
+
+    let mut client = CodexClient::spawn(codex_bin, config_overrides)?;
+    let initialize = client.initialize()?;
+    println!("< initialize response: {initialize:?}");
+
+    let thread_response = client.thread_start(ThreadStartParams {
+        dynamic_tools: dynamic_tools.clone(),
+        ..Default::default()
+    })?;
+    println!("< thread/start response: {thread_response:?}");
+
+    client.command_approval_behavior = match deny_on {
+        Some(index) => CommandApprovalBehavior::DenyOn(index),
+        None => CommandApprovalBehavior::AlwaysAccept,
+    };
+    client.command_approval_count = 0;
+    client.command_approval_item_ids.clear();
+    client.command_execution_statuses.clear();
+    client.last_turn_status = None;
+
+    let mut turn_params = TurnStartParams {
+        thread_id: thread_response.thread.id.clone(),
+        input: vec![V2UserInput::Text {
+            text: message,
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    turn_params.approval_policy = Some(AskForApproval::OnRequest);
+    turn_params.sandbox_policy = Some(SandboxPolicy::DangerFullAccess);
+
+    let turn_response = client.turn_start(turn_params)?;
+    println!("< turn/start response: {turn_response:?}");
+    client.stream_turn(&thread_response.thread.id, &turn_response.turn.id)?;
+
+    if client.command_approval_count < min_approvals {
+        bail!(
+            "expected at least {min_approvals} command approvals, got {}",
+            client.command_approval_count
+        );
+    }
+    let mut approvals_per_item = std::collections::BTreeMap::new();
+    for item_id in &client.command_approval_item_ids {
+        *approvals_per_item.entry(item_id.clone()).or_insert(0usize) += 1;
+    }
+    let max_approvals_for_one_item = approvals_per_item.values().copied().max().unwrap_or(0);
+    if max_approvals_for_one_item < min_approvals {
+        bail!(
+            "expected at least {min_approvals} approvals for one command item, got max {max_approvals_for_one_item} with map {approvals_per_item:?}"
+        );
+    }
+
+    let last_command_status = client.command_execution_statuses.last();
+    if deny_on.is_none() {
+        if last_command_status != Some(&CommandExecutionStatus::Completed) {
+            bail!("expected completed command execution, got {last_command_status:?}");
+        }
+        if client.last_turn_status != Some(TurnStatus::Completed) {
+            bail!(
+                "expected completed turn in all-accept flow, got {:?}",
+                client.last_turn_status
+            );
+        }
+    } else if last_command_status == Some(&CommandExecutionStatus::Completed) {
+        bail!(
+            "expected non-completed command execution in mixed approval/decline flow, got {last_command_status:?}"
+        );
+    }
+
+    println!(
+        "[zsh-fork multi-approval summary] approvals={}, approvals_per_item={approvals_per_item:?}, command_statuses={:?}, turn_status={:?}",
+        client.command_approval_count, client.command_execution_statuses, client.last_turn_status
+    );
+
+    Ok(())
 }
 
 fn resume_message_v2(
@@ -524,12 +668,31 @@ struct CodexClient {
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     pending_notifications: VecDeque<JSONRPCNotification>,
+    command_approval_behavior: CommandApprovalBehavior,
+    command_approval_count: usize,
+    command_approval_item_ids: Vec<String>,
+    command_execution_statuses: Vec<CommandExecutionStatus>,
+    last_turn_status: Option<TurnStatus>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommandApprovalBehavior {
+    AlwaysAccept,
+    DenyOn(usize),
 }
 
 impl CodexClient {
     fn spawn(codex_bin: &Path, config_overrides: &[String]) -> Result<Self> {
         let codex_bin_display = codex_bin.display();
         let mut cmd = Command::new(codex_bin);
+        if let Some(codex_bin_parent) = codex_bin.parent() {
+            let mut path = OsString::from(codex_bin_parent.as_os_str());
+            if let Some(existing_path) = std::env::var_os("PATH") {
+                path.push(":");
+                path.push(existing_path);
+            }
+            cmd.env("PATH", path);
+        }
         for override_kv in config_overrides {
             cmd.arg("--config").arg(override_kv);
         }
@@ -555,6 +718,11 @@ impl CodexClient {
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
             pending_notifications: VecDeque::new(),
+            command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            last_turn_status: None,
         })
     }
 
@@ -570,7 +738,12 @@ impl CodexClient {
                 },
                 capabilities: Some(InitializeCapabilities {
                     experimental_api: true,
-                    opt_out_notification_methods: None,
+                    opt_out_notification_methods: Some(
+                        NOTIFICATIONS_TO_OPT_OUT
+                            .iter()
+                            .map(|method| (*method).to_string())
+                            .collect(),
+                    ),
                 }),
             },
         };
@@ -810,10 +983,14 @@ impl CodexClient {
                     println!("\n< item started: {:?}", payload.item);
                 }
                 ServerNotification::ItemCompleted(payload) => {
+                    if let ThreadItem::CommandExecution { status, .. } = payload.item.clone() {
+                        self.command_execution_statuses.push(status);
+                    }
                     println!("< item completed: {:?}", payload.item);
                 }
                 ServerNotification::TurnCompleted(payload) => {
                     if payload.turn.id == turn_id {
+                        self.last_turn_status = Some(payload.turn.status.clone());
                         println!("\n< turn/completed notification: {:?}", payload.turn.status);
                         if payload.turn.status == TurnStatus::Failed
                             && let Some(error) = payload.turn.error
@@ -1014,6 +1191,12 @@ impl CodexClient {
         println!(
             "\n< commandExecution approval requested for thread {thread_id}, turn {turn_id}, item {item_id}"
         );
+        self.command_approval_count += 1;
+        let normalized_item_id = item_id
+            .split_once(":approval-exec-")
+            .map(|(command_item_id, _)| command_item_id.to_string())
+            .unwrap_or_else(|| item_id.clone());
+        self.command_approval_item_ids.push(normalized_item_id);
         if let Some(reason) = reason.as_deref() {
             println!("< reason: {reason}");
         }
@@ -1032,11 +1215,21 @@ impl CodexClient {
             println!("< proposed execpolicy amendment: {execpolicy_amendment:?}");
         }
 
+        let decision = match self.command_approval_behavior {
+            CommandApprovalBehavior::AlwaysAccept => CommandExecutionApprovalDecision::Accept,
+            CommandApprovalBehavior::DenyOn(index) if self.command_approval_count == index => {
+                CommandExecutionApprovalDecision::Decline
+            }
+            CommandApprovalBehavior::DenyOn(_) => CommandExecutionApprovalDecision::Accept,
+        };
         let response = CommandExecutionRequestApprovalResponse {
-            decision: CommandExecutionApprovalDecision::Accept,
+            decision: decision.clone(),
         };
         self.send_server_request_response(request_id, &response)?;
-        println!("< approved commandExecution request for item {item_id}");
+        println!(
+            "< commandExecution decision for approval #{} on item {item_id}: {:?}",
+            self.command_approval_count, decision
+        );
         Ok(())
     }
 

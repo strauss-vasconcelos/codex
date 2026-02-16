@@ -371,8 +371,14 @@ async fn main() -> Result<()> {
                     std::env::temp_dir().join(format!("czs-{}.sock", &socket_id[..12]))
                 };
                 #[cfg(unix)]
-                {
+                let listener = {
                     let _ = std::fs::remove_file(&wrapper_socket_path);
+                    UnixListener::bind(&wrapper_socket_path).with_context(|| {
+                        format!("bind wrapper socket at {}", wrapper_socket_path.display())
+                    })?
+                };
+                #[cfg(unix)]
+                {
                     cmd.env(
                         SIDECAREXEC_WRAPPER_SOCKET_ENV_VAR,
                         wrapper_socket_path.to_string_lossy().to_string(),
@@ -389,6 +395,10 @@ async fn main() -> Result<()> {
                 let mut child = match cmd.spawn() {
                     Ok(c) => c,
                     Err(err) => {
+                        #[cfg(unix)]
+                        {
+                            let _ = std::fs::remove_file(&wrapper_socket_path);
+                        }
                         write_json_line(
                             &mut stdout,
                             &JsonRpcErrorResponse {
@@ -466,11 +476,6 @@ async fn main() -> Result<()> {
                     });
                 }
                 drop(stream_tx);
-
-                #[cfg(unix)]
-                let listener = UnixListener::bind(&wrapper_socket_path).with_context(|| {
-                    format!("bind wrapper socket at {}", wrapper_socket_path.display())
-                })?;
 
                 let wait = child.wait();
                 tokio::pin!(wait);
