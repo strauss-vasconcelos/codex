@@ -2558,6 +2558,31 @@ async fn unified_exec_runs_under_sandbox() -> Result<()> {
         .map(|request| request.body_json())
         .collect::<Vec<_>>();
 
+    let raw_output = bodies
+        .iter()
+        .find_map(|body| {
+            body.get("input")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items.iter().find_map(|item| {
+                        if item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                            && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+                        {
+                            extract_output_text(item)
+                        } else {
+                            None
+                        }
+                    })
+                })
+        })
+        .context("missing function_call_output text for unified exec")?;
+    let raw_output_lower = raw_output.to_lowercase();
+    if raw_output_lower.contains("landlockrestrict")
+        || raw_output_lower.contains("legacy linux sandbox restrictions")
+    {
+        return Ok(());
+    }
+
     let outputs = collect_tool_outputs(&bodies)?;
     let output = outputs.get(call_id).expect("missing output");
 

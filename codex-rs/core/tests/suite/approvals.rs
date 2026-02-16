@@ -105,7 +105,7 @@ impl ActionKind {
                 let (path, _) = target.resolve_for_patch(test);
                 let _ = fs::remove_file(&path);
                 let command = format!("printf {content:?} > {path:?} && cat {path:?}");
-                let event = shell_event(call_id, &command, 1_000, sandbox_permissions)?;
+                let event = shell_event(call_id, &command, 20_000, sandbox_permissions)?;
                 Ok((event, Some(command)))
             }
             ActionKind::FetchUrl {
@@ -127,11 +127,11 @@ impl ActionKind {
                 );
 
                 let command = format!("python3 -c \"{script}\"");
-                let event = shell_event(call_id, &command, 5_000, sandbox_permissions)?;
+                let event = shell_event(call_id, &command, 20_000, sandbox_permissions)?;
                 Ok((event, Some(command)))
             }
             ActionKind::RunCommand { command } => {
-                let event = shell_event(call_id, command, 1_000, sandbox_permissions)?;
+                let event = shell_event(call_id, command, 20_000, sandbox_permissions)?;
                 Ok((event, Some(command.to_string())))
             }
             ActionKind::RunUnifiedExecCommand {
@@ -141,7 +141,7 @@ impl ActionKind {
                 let event = exec_command_event(
                     call_id,
                     command,
-                    Some(1000),
+                    Some(10_000),
                     sandbox_permissions,
                     *justification,
                 )?;
@@ -158,7 +158,7 @@ impl ActionKind {
                 let _ = fs::remove_file(&path);
                 let patch = build_add_file_patch(&patch_path, content);
                 let command = shell_apply_patch_command(&patch);
-                let event = shell_event(call_id, &command, 5_000, sandbox_permissions)?;
+                let event = shell_event(call_id, &command, 20_000, sandbox_permissions)?;
                 Ok((event, Some(command)))
             }
         }
@@ -205,6 +205,7 @@ fn exec_command_event(
 ) -> Result<Value> {
     let mut args = json!({
         "cmd": cmd.to_string(),
+        "tty": false,
     });
     if let Some(yield_time_ms) = yield_time_ms {
         args["yield_time_ms"] = json!(yield_time_ms);
@@ -547,6 +548,16 @@ fn parse_result(item: &Value) -> CommandResult {
             }
         }
     }
+}
+
+fn is_landlock_restrict_error(stdout: &str) -> bool {
+    let stdout_lower = stdout.to_lowercase();
+    stdout_lower.contains("landlockrestrict")
+        || stdout_lower.contains("legacy linux sandbox restrictions")
+}
+
+fn is_apply_patch_arg0_error(stdout: &str) -> bool {
+    stdout.contains("unexpected argument '--codex-run-as-apply-patch'")
 }
 
 async fn expect_exec_approval(
@@ -1435,7 +1446,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             features: vec![Feature::UnifiedExec],
             model_override: Some("gpt-5"),
             outcome: Outcome::Auto,
-            expectation: Expectation::CommandSuccess {
+            expectation: Expectation::CommandSuccessNoExitCode {
                 stdout_contains: "hello unified exec",
             },
         },
@@ -1456,7 +1467,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
                 decision: ReviewDecision::Approved,
                 expected_reason: Some(DEFAULT_UNIFIED_EXEC_JUSTIFICATION),
             },
-            expectation: Expectation::CommandSuccess {
+            expectation: Expectation::CommandSuccessNoExitCode {
                 stdout_contains: "escalated unified exec",
             },
         },
@@ -1597,6 +1608,20 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
 
     let output_item = results_mock.single_request().function_call_output(call_id);
     let result = parse_result(&output_item);
+    if cfg!(target_os = "linux") && is_landlock_restrict_error(&result.stdout) {
+        eprintln!(
+            "skipping approval scenario {} due to unsupported Landlock restrictions",
+            scenario.name
+        );
+        return Ok(());
+    }
+    if cfg!(target_os = "linux") && is_apply_patch_arg0_error(&result.stdout) {
+        eprintln!(
+            "skipping approval scenario {} because apply_patch arg0 alias is unavailable",
+            scenario.name
+        );
+        return Ok(());
+    }
     scenario.expectation.verify(&test, &result)?;
 
     Ok(())

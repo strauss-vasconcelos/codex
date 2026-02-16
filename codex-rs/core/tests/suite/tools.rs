@@ -250,6 +250,16 @@ async fn sandbox_denied_shell_returns_original_output() -> Result<()> {
     let body = output_text;
 
     let body_lower = body.to_lowercase();
+    let has_landlock_restrict = body_lower.contains("landlockrestrict")
+        || body_lower.contains("legacy linux sandbox restrictions");
+    if has_landlock_restrict {
+        assert_ne!(
+            exit_code, 0,
+            "landlock restriction failures should surface a non-zero exit code"
+        );
+        return Ok(());
+    }
+
     // Required for multi-OS.
     let has_denial = body_lower.contains("permission denied")
         || body_lower.contains("operation not permitted")

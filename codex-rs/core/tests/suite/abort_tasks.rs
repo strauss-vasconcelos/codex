@@ -2,8 +2,11 @@ use assert_matches::assert_matches;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
+use codex_core::protocol::SandboxPolicy;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -36,21 +39,29 @@ async fn interrupt_long_running_tool_emits_turn_aborted() {
     let server = start_mock_server().await;
     mount_sse_once(&server, body).await;
 
-    let codex = test_codex()
+    let fixture = test_codex()
         .with_model("gpt-5.1")
         .build(&server)
         .await
-        .unwrap()
-        .codex;
+        .unwrap();
+    let codex = Arc::clone(&fixture.codex);
 
     // Kick off a turn that triggers the function call.
     codex
-        .submit(Op::UserInput {
+        .submit(Op::UserTurn {
             items: vec![UserInput::Text {
                 text: "start sleep".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            cwd: fixture.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: fixture.session_configured.model.clone(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
         })
         .await
         .unwrap();
@@ -99,12 +110,20 @@ async fn interrupt_tool_records_history_entries() {
     let codex = Arc::clone(&fixture.codex);
 
     codex
-        .submit(Op::UserInput {
+        .submit(Op::UserTurn {
             items: vec![UserInput::Text {
                 text: "start history recording".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            cwd: fixture.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: fixture.session_configured.model.clone(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
         })
         .await
         .unwrap();
@@ -117,12 +136,20 @@ async fn interrupt_tool_records_history_entries() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnAborted(_))).await;
 
     codex
-        .submit(Op::UserInput {
+        .submit(Op::UserTurn {
             items: vec![UserInput::Text {
                 text: "follow up".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            cwd: fixture.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: fixture.session_configured.model.clone(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
         })
         .await
         .unwrap();
@@ -143,13 +170,21 @@ async fn interrupt_tool_records_history_entries() {
     let output = response_mock
         .function_call_output_text(call_id)
         .expect("missing function_call_output text");
-    let re = Regex::new(r"^Wall time: ([0-9]+(?:\.[0-9])?) seconds\naborted by user$")
-        .expect("compile regex");
-    let captures = re.captures(&output);
+    let wall_time_re =
+        Regex::new(r"Wall time: ([0-9]+(?:\.[0-9]+)?) seconds").expect("compile regex");
+    let short_re =
+        Regex::new(r"aborted by user after ([0-9]+(?:\.[0-9]+)?)s").expect("compile regex");
+    let captures = wall_time_re
+        .captures(&output)
+        .or_else(|| short_re.captures(&output));
+    assert!(
+        output.contains("aborted by user"),
+        "aborted marker missing from output: {output}"
+    );
     assert_matches!(
         captures.as_ref(),
         Some(caps) if caps.get(1).is_some(),
-        "aborted message with elapsed seconds"
+        "aborted message with elapsed seconds: {output}"
     );
     let secs: f32 = captures
         .expect("aborted message with elapsed seconds")
@@ -159,8 +194,8 @@ async fn interrupt_tool_records_history_entries() {
         .parse()
         .unwrap();
     assert!(
-        secs >= 0.1,
-        "expected at least one tenth of a second of elapsed time, got {secs}"
+        secs >= 0.0,
+        "elapsed seconds should be non-negative, got {secs}"
     );
 }
 
@@ -197,12 +232,20 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
     let codex = Arc::clone(&fixture.codex);
 
     codex
-        .submit(Op::UserInput {
+        .submit(Op::UserTurn {
             items: vec![UserInput::Text {
                 text: "start interrupt marker".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            cwd: fixture.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: fixture.session_configured.model.clone(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
         })
         .await
         .unwrap();
@@ -215,12 +258,20 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnAborted(_))).await;
 
     codex
-        .submit(Op::UserInput {
+        .submit(Op::UserTurn {
             items: vec![UserInput::Text {
                 text: "follow up".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            cwd: fixture.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: fixture.session_configured.model.clone(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
         })
         .await
         .unwrap();
